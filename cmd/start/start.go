@@ -66,6 +66,13 @@ type CFDevD interface {
 	Install() error
 }
 
+//go:generate mockgen -package mocks -destination mocks/driver.go code.cloudfoundry.org/cfdev/cmd/start Driver
+type Driver interface {
+	Start(cpus int, memory int, efiPath string) error
+	Stop() error
+	IsRunning() (bool, error)
+}
+
 //go:generate mockgen -package mocks -destination mocks/vpnkit.go code.cloudfoundry.org/cfdev/cmd/start VpnKit
 type VpnKit interface {
 	Start() error
@@ -118,6 +125,7 @@ type Args struct {
 	Registries          string
 	DeploySingleService string
 	DepsPath            string
+	EFIPath             string
 	NoProvision         bool
 	Cpus                int
 	Mem                 int
@@ -138,6 +146,7 @@ type Start struct {
 	VpnKit          VpnKit
 	AnalyticsD      AnalyticsD
 	Hypervisor      Hypervisor
+	Driver          Driver
 	Stop            Stop
 	Provisioner     Provisioner
 	Provision       Provision
@@ -145,8 +154,10 @@ type Start struct {
 	Profiler        SystemProfiler
 }
 
-const compatibilityVersion = "v4"
-const defaultMemory = 4192
+const (
+	compatibilityVersion = "v4"
+	defaultMemory        = 4192
+)
 
 func (s *Start) Cmd() *cobra.Command {
 	args := Args{}
@@ -167,8 +178,10 @@ func (s *Start) Cmd() *cobra.Command {
 	pf.IntVarP(&args.Mem, "memory", "m", 0, "memory to allocate to vm in MB")
 	pf.BoolVarP(&args.NoProvision, "no-provision", "n", false, "start vm but do not provision")
 	pf.StringVarP(&args.DeploySingleService, "white-listed-services", "s", "", "list of supported services to deploy")
+	pf.StringVarP(&args.EFIPath, "efi", "e", filepath.Join(s.Config.BinaryDir, "cfdev-efi-v2.iso"), "path to efi boot iso")
 
 	pf.MarkHidden("no-provision")
+	pf.MarkHidden("efi")
 	return cmd
 }
 
@@ -180,8 +193,7 @@ func (s *Start) Execute(args Args) error {
 		case name := <-s.LocalExit:
 			s.UI.Say("ERROR: %s has stopped", name)
 		}
-		s.Hypervisor.Stop("cfdev")
-		s.VpnKit.Stop()
+		s.Driver.Stop()
 		os.Exit(128)
 	}()
 
@@ -215,7 +227,7 @@ func (s *Start) Execute(args Args) error {
 		return err
 	}
 
-	if running, err := s.Hypervisor.IsRunning("cfdev"); err != nil {
+	if running, err := s.Driver.IsRunning(); err != nil {
 		return e.SafeWrap(err, "is running")
 	} else if running {
 		s.UI.Say("CF Dev is already running...")
@@ -243,6 +255,7 @@ func (s *Start) Execute(args Args) error {
 		s.Config.Dependencies.Remove("cfdevd")
 	}
 
+	// the two invocations below are "privileged actions"
 	if err := s.osSpecificSetup(); err != nil {
 		return err
 	}
@@ -292,25 +305,9 @@ func (s *Start) Execute(args Args) error {
 		return err
 	}
 
-	s.UI.Say("Creating the VM...")
-	if err := s.Hypervisor.CreateVM(hypervisor.VM{
-		Name:     "cfdev",
-		CPUs:     args.Cpus,
-		MemoryMB: memoryToAllocate,
-	}); err != nil {
-		return e.SafeWrap(err, "creating the vm")
-	}
-
-	s.UI.Say("Starting VPNKit...")
-	if err := s.VpnKit.Start(); err != nil {
-		return e.SafeWrap(err, "starting vpnkit")
-	}
-
-	s.VpnKit.Watch(s.LocalExit)
-
-	s.UI.Say("Starting the VM...")
-	if err := s.Hypervisor.Start("cfdev"); err != nil {
-		return e.SafeWrap(err, "starting the vm")
+	err = s.Driver.Start(args.Cpus, memoryToAllocate, args.EFIPath)
+	if err != nil {
+		return err
 	}
 
 	s.UI.Say("Waiting for the VM...")
